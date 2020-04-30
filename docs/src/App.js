@@ -7,7 +7,7 @@ import "ace-builds/src-noconflict/mode-latex";
 import "ace-builds/src-noconflict/mode-json";
 import "ace-builds/src-noconflict/theme-monokai";
 
-const latteHost = 'http://35.235.126.220/generate';
+const latteHost = 'https://latte-pdf.herokuapp.com/generate';
 const headers = {
 	'Content-Type': 'application/json',
 	'Access-Control-Allow-Origin': '*',
@@ -45,10 +45,18 @@ export default class App extends React.Component {
 			headers: headers,
 			body: JSON.stringify({ template: tmpl, details: dtls}),
 		}
-		const blob = await fetch(latteHost, request)
-			.then(r => r.blob())
+		var ok = false;
+		const response = await fetch(latteHost, request)
+			.then(r => {
+				if (r.ok) {
+					ok = true;
+					return r.blob()
+				}
+				return r.json() 
+			})
 			.catch(err => console.log(err));
-		this.setState({ pdf: blob });
+        console.log(response);
+		ok ? this.setState({ pdf: response }) : alert(response.data);
 	}
 
 	clearTex() {
@@ -59,7 +67,12 @@ export default class App extends React.Component {
 		this.setState({ json: '' });
 	}
 
-	render() {
+    render() {
+        const pdf = this.state.pdf;
+        var pdfURL = undefined;
+        if (pdf != undefined) {
+            pdfURL = window.URL.createObjectURL(pdf);
+        }
 		return (
 		<div>
 			<div id="button-banner">
@@ -72,6 +85,7 @@ export default class App extends React.Component {
 				<button className="button" onClick={() => this.clearJSON()}>
 					Clear JSON
 				</button>
+        		{ pdfURL ? <a className="linkButton button" href={pdfURL} download="LaTTe.pdf">Download PDF</a> : null }
 				<form id="github" action="https://github.com/raphaelreyna/latte">
     			<input className="button" type="submit" value="Github" />
 				</form>

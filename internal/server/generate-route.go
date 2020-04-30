@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hashicorp/golang-lru"
 	"github.com/raphaelreyna/latte/internal/compile"
 	"io"
 	"io/ioutil"
@@ -17,14 +18,23 @@ import (
 	"text/template"
 )
 
-func (s *Server) handleGenerate() http.HandlerFunc {
+func (s *Server) handleGenerate() (http.HandlerFunc, error) {
+	type delimiters struct {
+		Left  string `json:"left"`
+		Right string `json:"right"`
+	}
 	type request struct {
 		// Template is base64 encoded .tex file
 		Template string `json:"template"`
 		// Details must be a json object
 		Details map[string]interface{} `json:"details"`
 		// Resources must be a json object whose keys are the resources file names and value is the base64 encoded string of the file
-		Resources map[string]string `json:"resources"`
+		Resources  map[string]string `json:"resources"`
+		Delimiters *delimiters       `json:"delimiters, omitempty"`
+	}
+	type errorResponse struct {
+		Error string `json:"error"`
+		Data  string `json:"data,omitempty"`
 	}
 	type job struct {
 		tmpl    *template.Template
@@ -32,15 +42,23 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 		dir     string
 	}
 	type templates struct {
-		t map[string]*template.Template
+		t *lru.Cache
 		sync.Mutex
 	}
 	type resources struct {
-		r map[string]string
+		r *lru.Cache
 		sync.Mutex
 	}
-	tmpls := &templates{t: map[string]*template.Template{}}
-	rscs := &resources{r: map[string]string{}}
+	tmplsCache, err := lru.New(s.tCacheSize)
+	if err != nil {
+		return nil, err
+	}
+	rscsCache, err := lru.New(s.rCacheSize)
+	if err != nil {
+		return nil, err
+	}
+	tmpls := &templates{t: tmplsCache}
+	rscs := &resources{r: rscsCache}
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Create temporary directory into which we'll copy all of the required resource files
 		// and eventually run pdflatex in.
@@ -59,6 +77,7 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 			}()
 		}()
 		j := job{dir: workDir, details: map[string]interface{}{}}
+		delims := delimiters{Left: "#!", Right: "!#"}
 		// Grab any data sent as JSON
 		if r.Header.Get("Content-Type") == "application/json" {
 			var req request
@@ -73,12 +92,23 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 				return
 			}
 			r.Body.Close()
+			if req.Delimiters != nil {
+				d := req.Delimiters
+				if d.Left == "" || d.Right == "" {
+					s.respond(w, "only received one delimiter; need none or both", http.StatusBadRequest)
+					return
+				}
+				delims = *req.Delimiters
+			}
 			if req.Template != "" {
 				// Check if we've already parsed this template; if not, parse it and cache the results
 				tHash := md5.Sum([]byte(req.Template))
-				cid := hex.EncodeToString(tHash[:])
+				// We append template delimiters to account for the same file being uploaded with different delimiters.
+				// This would really only happen on accident but not taking it into account leads to unexpected caching behavior.
+				cid := hex.EncodeToString(tHash[:]) + delims.Left + delims.Right
 				tmpls.Lock()
-				t, exists := tmpls.t[cid]
+				ti, exists := tmpls.t.Get(cid)
+				var t *template.Template
 				if !exists {
 					tBytes, err := base64.StdEncoding.DecodeString(req.Template)
 					if err != nil {
@@ -87,14 +117,18 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 						http.Error(w, err.Error(), http.StatusInternalServerError)
 						return
 					}
-					t, err = template.New(cid).Delims("#!", "!#").Parse(string(tBytes))
+					t = template.New(cid).Delims(delims.Left, delims.Right)
+					t, err = t.Parse(string(tBytes))
 					if err != nil {
 						tmpls.Unlock()
 						s.errLog.Println(err)
 						http.Error(w, err.Error(), http.StatusInternalServerError)
 						return
 					}
-					tmpls.t[cid] = t
+
+					tmpls.t.Add(cid, t)
+				} else {
+					t = ti.(*template.Template)
 				}
 				j.tmpl = t
 				tmpls.Unlock()
@@ -124,8 +158,10 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 		q := r.URL.Query()
 		// Grab template being requested in the URL
 		if tmplID := q.Get("tmpl"); j.tmpl == nil && tmplID != "" {
+			tmplID = tmplID + delims.Left + delims.Right
 			tmpls.Lock()
-			t, exists := tmpls.t[tmplID]
+			ti, exists := tmpls.t.Get(tmplID)
+			var t *template.Template
 			if !exists {
 				// Try loading the template file from local disk, downloading it if it doesn't exist
 				tmplPath := filepath.Join(s.rootDir, tmplID)
@@ -175,14 +211,17 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 						return
 					}
 				}
-				t, err = template.New(tmplID).Delims("#!", "!#").Parse(string(tmplBytes))
+				t = template.New(tmplID).Delims(delims.Left, delims.Right)
+				t, err = t.Parse(string(tmplBytes))
 				if err != nil {
 					tmpls.Unlock()
 					s.errLog.Println(err)
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				tmpls.t[tmplID] = t
+				tmpls.t.Add(tmplID, t)
+			} else {
+				t = ti.(*template.Template)
 			}
 			j.tmpl = t
 			tmpls.Unlock()
@@ -197,7 +236,8 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 		for _, rscID := range rscsIDs {
 			// Prevent other routines from downloading this resource if its not found and we're already downloading it.
 			rscs.Lock()
-			rscPath, exists := rscs.r[rscID]
+			rscPathi, exists := rscs.r.Get(rscID)
+			var rscPath string
 			if _, err = os.Stat(rscPath); os.IsNotExist(err) || !exists {
 				if s.db == nil {
 					rscs.Unlock()
@@ -229,7 +269,9 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				rscs.r[rscID] = rscPath
+				rscs.r.Add(rscID, rscPath)
+			} else {
+				rscPath = rscPathi.(string)
 			}
 			rscs.Unlock()
 			err = os.Symlink(rscPath, filepath.Join(workDir, rscID))
@@ -246,62 +288,103 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 			if os.IsNotExist(err) {
 				if s.db == nil {
 					msg := fmt.Sprintf("details json with id %s not found", dtID)
-					s.respond(w, msg, http.StatusBadRequest)
+					er := errorResponse{Error: msg}
+					w.Header().Set("Content-Type", "application/json")
+					payload := s.respond(w, &er, http.StatusInternalServerError)
+					s.errLog.Println("%s", payload)
 					return
 				}
 				dtlsData, err := s.db.Fetch(r.Context(), dtID)
 				switch err.(type) {
 				case *NotFoundError:
 					msg := fmt.Sprintf("details json with id %s not found", dtID)
-					http.Error(w, msg, http.StatusInternalServerError)
+					er := errorResponse{Error: msg}
+					w.Header().Set("Content-Type", "application/json")
+					payload := s.respond(w, &er, http.StatusInternalServerError)
+					s.errLog.Println("%s", payload)
 					return
 				default:
 					if err != nil {
-						s.errLog.Println(err)
-						http.Error(w, err.Error(), http.StatusInternalServerError)
+						er := errorResponse{
+							Error: "error while getting json file info",
+							Data:  err.Error(),
+						}
+						w.Header().Set("Content-Type", "application/json")
+						payload := s.respond(w, &er, http.StatusInternalServerError)
+						s.errLog.Println("%s", payload)
 						return
 					}
 				}
 				err = toDisk(dtlsData, dtlsPath)
 				if err != nil {
-					s.errLog.Printf("error while writing to %s: %v", dtlsPath, err)
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+					er := errorResponse{
+						Error: "error while writing json file to disk",
+						Data:  err.Error(),
+					}
+					w.Header().Set("Content-Type", "application/json")
+					payload := s.respond(w, &er, http.StatusInternalServerError)
+					s.errLog.Println("%s", payload)
 					return
 				}
 				switch dtlsData.(type) {
 				case []byte:
 					err = json.Unmarshal(dtlsData.([]byte), &j.details)
 					if err != nil {
-						s.errLog.Println(err)
-						http.Error(w, err.Error(), http.StatusInternalServerError)
+						er := errorResponse{
+							Error: "error while decoding json",
+							Data:  err.Error(),
+						}
+						w.Header().Set("Content-Type", "application/json")
+						payload := s.respond(w, &er, http.StatusInternalServerError)
+						s.errLog.Println("%s", payload)
 						return
 					}
 				case io.ReadCloser:
 					rc := dtlsData.(io.ReadCloser)
 					err = json.NewDecoder(rc).Decode(&j.details)
 					if err != nil {
-						s.errLog.Println(err)
-						http.Error(w, err.Error(), http.StatusInternalServerError)
+						er := errorResponse{
+							Error: "error while decoding json",
+							Data:  err.Error(),
+						}
+						w.Header().Set("Content-Type", "application/json")
+						payload := s.respond(w, &er, http.StatusInternalServerError)
+						s.errLog.Println("%s", payload)
 						return
 					}
 					rc.Close()
 				}
 			} else if err != nil {
-				s.errLog.Println(err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				er := errorResponse{
+					Error: "error while getting json file info",
+					Data:  err.Error(),
+				}
+				w.Header().Set("Content-Type", "application/json")
+				payload := s.respond(w, &er, http.StatusInternalServerError)
+				s.errLog.Println("%s", payload)
 				return
 			}
 			if len(j.details) == 0 {
 				f, err := os.Open(dtlsPath)
 				if err != nil {
-					s.errLog.Println(err)
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+					er := errorResponse{
+						Error: "error while opening json file",
+						Data:  err.Error(),
+					}
+					w.Header().Set("Content-Type", "application/json")
+					payload := s.respond(w, &er, http.StatusInternalServerError)
+					s.errLog.Println("%s", payload)
 					return
 				}
 				err = json.NewDecoder(f).Decode(&j.details)
 				if err != nil {
-					s.errLog.Println(err)
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+					er := errorResponse{
+						Error: "error while decoding json",
+						Data:  err.Error(),
+					}
+					w.Header().Set("Content-Type", "application/json")
+					payload := s.respond(w, &er, http.StatusInternalServerError)
+					s.errLog.Println("%s", payload)
 					return
 				}
 				f.Close()
@@ -310,18 +393,21 @@ func (s *Server) handleGenerate() http.HandlerFunc {
 		// Compile pdf
 		pdfPath, err := compile.Compile(r.Context(), j.tmpl, j.details, j.dir, s.cmd)
 		if err != nil {
-			s.errLog.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			er := &errorResponse{Error: err.Error(), Data: string(pdfPath)}
+			w.Header().Set("Content-Type", "application/json")
+			payload := s.respond(w, er, http.StatusInternalServerError)
+			s.errLog.Printf("%s", payload)
 			return
 		}
 		pdf, err := os.Open(filepath.Join(workDir, pdfPath))
 		if err != nil {
-			s.errLog.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			payload := s.respond(w, &errorResponse{Error: "encountered an error"}, http.StatusInternalServerError)
+			s.errLog.Printf("%s", payload)
 			return
 		}
 		w.Header().Set("Content-Type", "application/pdf")
 		io.Copy(w, pdf)
 		pdf.Close()
-	}
+	}, nil
 }

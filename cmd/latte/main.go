@@ -7,6 +7,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
+)
+
+const (
+	// If cache sizes is not provided by environment, default to 15 for both
+	defaultTCS = 15
+	defaultRCS = 15
 )
 
 var db server.DB
@@ -27,6 +34,13 @@ func main() {
 		cmd = "pdftex"
 	}
 
+	// If user provides a directory path or a tex file, then run as cli tool and not as http server
+	if len(os.Args) > 1 {
+		if os.Args[1] != "server" {
+			cli(cmd, errLog, infoLog)
+			os.Exit(0)
+		}
+	}
 	root := os.Getenv("LATTE_ROOT")
 	if root == "" {
 		root, err = os.UserCacheDir()
@@ -35,12 +49,25 @@ func main() {
 		}
 	}
 	infoLog.Printf("root cache directory: %s", root)
-	s, err := server.NewServer(root, cmd, db, errLog, infoLog)
+
+	tCacheSize := os.Getenv("LATTE_TMPL_CACHE_SIZE")
+	tcs, err := strconv.Atoi(tCacheSize)
+	if err != nil {
+		infoLog.Printf("couldn't pull templates cache size from environment: defaulting to %d", defaultTCS)
+		tcs = defaultTCS
+	}
+	rCacheSize := os.Getenv("LATTE_RSC_CACHE_SIZE")
+	rcs, err := strconv.Atoi(rCacheSize)
+	if err != nil {
+		infoLog.Printf("couldn't pull resources cache size from environment: defaulting to %d", defaultRCS)
+		rcs = defaultRCS
+	}
+	s, err := server.NewServer(root, cmd, db, errLog, infoLog, tcs, rcs)
 	if err != nil {
 		errLog.Fatal(err)
 	}
 
-	port := os.Getenv("LATTE_PORT")
+	port := os.Getenv("PORT")
 	if port == "" {
 		port = "27182"
 	}
